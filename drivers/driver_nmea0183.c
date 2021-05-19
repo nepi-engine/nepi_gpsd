@@ -3632,6 +3632,190 @@ static gps_mask_t processSTI(int count, char *field[],
     return mask;
 }
 
+/*
+ * $PAUV,<unix_time>,<A|V>,<lat>,<N|S>,<lon>,<E|W>,<SOG>,<COG>,<hdg>,<dpt>,<alt>,<roll>,<pitch>
+ *
+ * 1. <unix_time>      current number of seconds since the Unix epoch
+ * 2. <A|V>            'A' if data is valid of 'V' if data is invalid
+ * 3. <lat>            latitude in decimal degrees
+ * 4. <N|S>            N for North, S for South
+ * 5. <lon>            longitude, decimal degrees
+ * 6. <E|S>            E for east, W for west
+ * 7. <SOG>            speed over ground, knots
+ * 8. <COG>            course over ground, degrees
+ * 9. <hdg>            true heading
+ * 10. <dpt>           depth, meters
+ * 11. <alt>           altitude, meters
+ * 12. <roll>          roll, deg
+ * 13. <pitch>         pitch, deg
+ */
+static gps_mask_t processPAUV(int count, char *field[],
+                              struct gps_device_t *session)
+{
+    gps_mask_t mask = ONLINE_SET;
+    session->newdata.mode = MODE_NO_FIX; // Will promote later
+    mask |= (MODE_SET);
+    session->newdata.status = STATUS_NO_FIX; // Will promote later
+    mask |= (STATUS_SET);
+
+    if ( count != 14 ) {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid field count (%d), expected 14\n", count);
+        return mask;
+    }
+
+    // Check for validity
+    if ( field[2][0] != 'A' ) {
+        GPSD_LOG(LOG_DATA, &session->context->errout,
+                 "NMEA0183: PAUV: Data reports as invalid\n");
+        return mask;
+    }
+    session->newdata.status = STATUS_FIX;
+    
+    // Timestamp -- need to convert unix to timespec
+    time_t tstamp_unix = (time_t)(atoi(field[1]));
+    if ( 0 == tstamp_unix ) {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid unix timestamp - %s\n", field[1]);
+    }
+    else {
+        // First, set the NMEA date
+        struct tm *local_time = localtime(&tstamp_unix);
+        memcpy(&(session->nmea.date), local_time, sizeof(struct tm));
+
+        // Now set the GPS fix timestamp
+        session->newdata.time.tv_sec = tstamp_unix;
+        session->newdata.time.tv_nsec = 0;
+        mask |= (TIME_SET);
+    }
+
+    // Latitude
+    double latitude_deg = safe_atof(field[3]);
+    if (field[4][0] == 'N') {
+        session->newdata.latitude = latitude_deg;
+    }
+    else if (field[4][0] == 'S') {
+        session->newdata.latitude = -latitude_deg;
+    }
+
+    // Longitude
+    double longitude_deg = safe_atof(field[5]);
+    if (field[6][0] == 'E') {
+        session->newdata.longitude = longitude_deg;
+    }
+    else if (field[6][0] == 'W') {
+        session->newdata.longitude = -longitude_deg;
+    }
+
+    // If at least one of lat/lon was valid, set the mode and update the mask
+    if ((session->newdata.latitude != 0.0) || (session->newdata.longitude != 0.0)) {
+        session->newdata.mode = MODE_2D;
+        mask |= (LATLON_SET);
+    }
+    else {
+      GPSD_LOG(LOG_ERROR, &session->context->errout,
+               "NMEA0183: PAUV: Invalid lat/lon string - %s,%s,%s,%s\n", field[3], field[4], field[5], field[6]);
+    }
+
+    // Speed over ground
+    double speed_knots = safe_atof(field[7]);
+    if (speed_knots != 0.0) {
+        session->newdata.speed = speed_knots * KNOTS_TO_MPS;
+        mask |= (SPEED_SET);
+    }
+    else {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid speed - %s\n", field[7]);
+    }
+
+    // Course over ground
+    double course_over_ground = safe_atof(field[8]);
+    if (course_over_ground != 0.0) {
+        session->newdata.track = course_over_ground;
+        mask |= (TRACK_SET);
+    }
+    else {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid course over ground - %s\n", field[8]);
+    }
+
+    // Heading
+    double heading = safe_atof(field[9]);
+    if ((heading > 0.0) && (heading < 360.0)) {
+        session->gpsdata.attitude.heading = heading;
+        mask |= (ATTITUDE_SET);
+    }
+    else {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid heading - %s\n", field[9]);
+    }
+
+    // Depth
+    double depth_m = safe_atof(field[10]);
+    if (0.0 != depth_m) {
+        session->newdata.depth = depth_m;
+        session->newdata.mode = MODE_3D;
+        mask |= (ALTITUDE_SET);
+    }
+    else {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid depth - %s\n", field[10]);
+    }
+
+    // Altitude
+    double altitude_m = safe_atof(field[11]);
+    if (0.0 != altitude_m) {
+        session->newdata.altHAE = altitude_m;
+        session->newdata.mode = MODE_3D;
+        mask |= (ALTITUDE_SET);
+    }
+    else {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid altitude - %s\n", field[11]);
+    }
+
+    // Roll
+    double roll_deg = safe_atof(field[12]);
+    if (0.0 != roll_deg) {
+        session->gpsdata.attitude.roll = roll_deg;
+        mask |= (ATTITUDE_SET);
+    }
+    else {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid roll - %s\n", field[12]);
+    }
+
+    // Pitch
+    double pitch_deg = safe_atof(field[13]);
+    if (0.0 != pitch_deg) {
+        session->gpsdata.attitude.pitch = pitch_deg;
+        mask |= (ATTITUDE_SET);
+    }
+    else {
+        GPSD_LOG(LOG_ERROR, &session->context->errout,
+                 "NMEA0183: PAUV: Invalid pitch - %s\n", field[13]);
+    }
+
+    GPSD_LOG(LOG_DATA, &session->context->errout,
+             "NMEA0183: PAUV: unix_time=%ld lat=%.2f lon=%.2f "
+             "speed=%.2f track=%.2f heading=%.2f depth=%.2f "
+             "altitude=%.2f roll=%.2f pitch=%.2f "
+             "mode=%d status=%d\n",
+             session->newdata.time.tv_sec,
+             session->newdata.latitude,
+             session->newdata.longitude,
+             session->newdata.speed,
+             session->newdata.track,
+             session->gpsdata.attitude.heading,
+             session->newdata.depth,
+             session->newdata.altHAE,
+             session->gpsdata.attitude.roll,
+             session->gpsdata.attitude.pitch,
+             session->newdata.mode,
+             session->newdata.status);
+    return mask;
+}
+
 /**************************************************************************
  *
  * Entry points begin here
@@ -3748,6 +3932,8 @@ gps_mask_t nmea_parse(char *sentence, struct gps_device_t * session)
         {"XDR", 0,  false, NULL},       /* ignore $HCXDR, IMU? */
         {"XTE", 0,  false, NULL},       /* ignore Cross-Track Error */
         {"ZDA", 4,  false, processZDA},
+        /* Numurus-handled Sentences */
+        {"PAUV", 13, false, processPAUV},
         {NULL, 0,  false, NULL},        // no more
     };
 
