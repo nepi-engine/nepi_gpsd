@@ -1,0 +1,253 @@
+= GPSD Numbers Matter
+Gary E. Miller <gem@rellim.com>
+10 March 2021
+:author: Gary E. Miller
+:description: How and why  GPSD tortures numbers.
+:email: <gem@rellim.com>
+:keywords: gpsd, NaN, precision
+:robots: index,follow
+:sectlinks:
+:source-highlighter: rouge
+:toc: macro
+
+include::inc-menu.adoc[]
+
+== ABSTRACT
+
+Geodesy tortures numbers harder than almost any other discipline.  It
+requires that very large numbers be known to very small precision.  This
+leads to some unexpected, sometimes perplexing, choices in how *gpsd*
+handles numbers.  This white paper will explore many of those choices.
+
+== Latitude and Longitude
+
+Your GNSS receiver starts with really big, numbers. Like the Earth's
+polar radius: 6356752.314245. Then with the help of a lot of math,
+computes your position to a high precision. The u-blox ZED-F9P reports
+0.1 mm (1e-9 or 0.000000001 degree) precision. That is about 12
+decimal digits of precision. It is certainly not that accurate, maybe
+soon. No matter, *gpsd* wants to not lose the precision of the data it
+is given.
+
+12 digits of precision fits in a C double which has 15.95 decimal
+digits of precision (53 binary bits of precision). printf() format %f
+defaults to %.6f, which will truncate the result. so print with %.7f, or
+even %9f, if you have a survey grade GPS. Here is a rought idea of how
+degrees relate to distance, at the equator:
+
+|====
+|Degrees|DMS|Distance at equator
+
+|0.0001|0° 00′ 0.36″|11.132 m
+|0.000001|0° 00′ 0.0036″|11.132 cm
+|0.00000001|0° 00′ 0.000036″|1.1132 mm
+|====
+Source: <<DD>>
+
+
+Python floats are very similar to C doubles, plus some annoying bugs
+related to <<NaN>>.
+
+See <<DD>> for more information on Decimal Degrees and precision.
+
+== Time
+
+In the "Latitude and Longitude" section above we learned that C doubles
+are just fine tor holding position information.  The same can not be said
+for "Time". There is loss of precision when storing time as a double!
+
+ * A double is 53 significant bits.
+ * POSIX time to nanoSec precision is 62 significant bits
+ * POSIX time to nanoSec precision after 2038 is 63 bits
+ * POSIX time as a double is only microSec precision
+
+That is why POSIX time as a double and PPS do not play well together.
+
+WARNING:: Loss of precision telling time as a double!
+
+That is why *gpsd* tells time using *struct timespec*.  That look like this:
+
+[source,c]
+----
+  struct timespec {
+      time_t  tv_sec;  /* Seconds */
+      long    tv_nsec; /* Nanoseconds */
+  };
+----
+
+*time_t* is usually a 64-bit integer. Older systems, and some 32-bit
+systems, define *time_t* as a 32-bit integer, which is deprecated. A
+32-bit integer will overflow at: 03:14:07 UTC on 19 January 2038. Plan
+for that apocalypse now.  Source: <<Y2038>>
+
+== NaN ain't your Nana
+
+The most obviously confounding choice is the use in *gpsd* of *NaNs*
+(Not A Number). *gpsd* keeps track of a large number of individual
+numbers, most of them are invalid at any one time. To keep track of
+which integers are valid, a bit field is used. When an integer is
+valid, a corresponding bit is set. Keeping track of which bit matches
+which integer is challenging. <<IEEE754>> eliminates that problem with
+floating point numbers.
+
+When *gpsd* marks a floating point number invalid, it sets the value to
+<<NaN>>. So before using any *gpsd* floating point number, check that
+it is valid. C obeys <<IEEE754>>. Python sort of does, enough for our
+purposes.
+
+=== C NaN
+
+A little C program will make the behavior of <<NaN>> easy to see:
+
+[source%nowrap,c,numbered]
+----
+// Compile with: gcc nan.c -o nan
+#include <stdio.h>     // for printf()
+
+int main(int argc, char **argv)
+{
+    double a = 1.0 / 0.0;
+    double b = -1.0 / 0.0;
+    printf("a: %f b: %f\n", a, b);
+}
+----
+
+What do you expect to see whan that program is run?  Try it:
+
+----
+~ $ gcc nan.c -o nan
+~ $ ./nan
+a: inf b: -inf
+----
+
+1.0 divided by 0.0 is infinity.  -1.0 divided by 0.0 is negative infinity.
+
+Any program that printed out a lot of "inf" or -inf" would annoy the users
+and they would complain.  To avoid that, *gpsd* clients check, and print
+out "n/a" instead.
+
+Here is a common solution:
+
+[source%nowrap,c,numbered]
+----
+// Compile with: gcc nan.c -o nan
+#include <math.h>      // for isnan()
+#include <stdio.h>     // for printf()
+  
+int main(int argc, char **argv)
+{
+    double a = 1.0 / 0.0;
+    if (isnan(a)) {
+        printf("a: n/a\n");
+    } else {
+        printf("a: %f\n", a);
+    }
+}
+----
+
+What do you expect to see whan that program is run?  Try it:
+
+----
+~ $ gcc  nan.c -o nan
+~ $ ./nan
+a: inf
+----
+
+Whoops.  All <<NaN>>s are not <<NaN>>s!  Very confusing, rather than try to
+explain, I'll send you to the Wikipedia explanation: <<NaN>>.  But there
+is a simple solution.  We do not really care if a number if <<NaN>>, or if it
+is infinity.  We care that it is finite, and that is easy to test for:
+
+[source%nowrap,c,numbered]
+----
+// Compile with: gcc nan.c -o nan
+#include <math.h>      // for isfinite()
+#include <stdio.h>     // for printf()
+  
+int main(int argc, char **argv)
+{
+    double a = 1.0 / 0.0;
+    if (isfinite(a)) {
+        printf("a: %f\n", a);
+    } else {
+        printf("a: n/a\n");
+    }
+}
+----
+
+What do you expect to see whan that program is run?  Try it:
+
+----
+~ $ gcc  nan.c -o nan
+~ $ ./nan
+a: n/a
+----
+
+Exactly the desired result.  Now you know why *isfinite()* is all over
+*gpsd* client code.
+
+=== Python NaN
+
+Python is similar, it almost follows <<IEEE754>>, but has many undocumented
+"features" that conflict with <<IEEE754>>:
+
+[source%nowrap,numbered]
+----
+# python
+>>> a = 1.0 / 0.0
+Traceback (most recent call last):
+  File "<stdin>", line 1, in <module>
+ZeroDivisionError: float division by zero
+----
+
+For shame.  It does provide a sideways method to set a variable to
+various <<NaN>>s:
+
+----
+~ $ python
+>>> Inf = float('inf')
+>>> Ninf = float('-inf')
+>>> NaN = float('NaN')
+>>> print("Inf: %f Ninf: %f NaN: %f" % (Inf, Ninf, NaN))
+Inf: inf Ninf: -inf NaN: nan
+----
+
+And *math.isnan()* and *math.isfinite()* work as expected.  Continuing
+the previous example:
+
+----
+>>> import math
+>>> math.isnan(Inf)
+False
+>>> math.isnan(NaN)
+True
+>>> math.isfinite(NaN)
+False
+>>> math.isfinite(Inf)
+False
+----
+
+And that is why *gpsd* uses *math.isfinite()* instead of *math.isnan()*.
+
+<<NaN>>s have many other interesting properties, be sure to read up on
+the subject. The <<IEEE754>> document is a closed source standard. For a
+public description look at the Wikipedia <<NaN>> article.
+
+== REFERENCES
+
+[bibliography]
+* [[[DD]]] https://en.wikipedia.org/wiki/Decimal_degrees[Decimal Degrees] Wikipedia Article
+
+* [[[Y2038]]] https://en.wikipedia.org/wiki/Year_2038_problem[2038 Problem] Wikipedia article
+
+* [[[IEEE754]]] https://standards.ieee.org/standard/754-2019.html[IEEE Standard
+for Floating-Point Arithmetic]
+
+* [[[NaN]]] https://en.wikipedia.org/wiki/NaN[NaN] Wikipedia Article
+
+* *GPSD Project web site:* {gpsdweb}
+
+== COPYING
+
+This file is Copyright 2021 by the GPSD project +
+SPDX-License-Identifier: BSD-2-clause
