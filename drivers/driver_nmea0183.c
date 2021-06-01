@@ -3637,10 +3637,10 @@ static gps_mask_t processSTI(int count, char *field[],
  *
  * 1. <unix_time>      current number of seconds since the Unix epoch
  * 2. <A|V>            'A' if data is valid of 'V' if data is invalid
- * 3. <lat>            latitude in decimal degrees
+ * 3. <lat>            latitude in format 4807.038 = 48 deg 07.038'
  * 4. <N|S>            N for North, S for South
- * 5. <lon>            longitude, decimal degrees
- * 6. <E|S>            E for east, W for west
+ * 5. <lon>            longitude in format 01131.324 11 deg 31.324'
+ * 6. <E|W>            E for east, W for west
  * 7. <SOG>            speed over ground, knots
  * 8. <COG>            course over ground, degrees
  * 9. <hdg>            true heading
@@ -3671,7 +3671,7 @@ static gps_mask_t processPAUV(int count, char *field[],
         return mask;
     }
     session->newdata.status = STATUS_FIX;
-    
+
     // Timestamp -- need to convert unix to timespec
     time_t tstamp_unix = (time_t)(atoi(field[1]));
     if ( 0 == tstamp_unix ) {
@@ -3690,27 +3690,9 @@ static gps_mask_t processPAUV(int count, char *field[],
     }
 
     // Latitude
-    double latitude_deg = safe_atof(field[3]);
-    if (field[4][0] == 'N') {
-        session->newdata.latitude = latitude_deg;
-    }
-    else if (field[4][0] == 'S') {
-        session->newdata.latitude = -latitude_deg;
-    }
-
-    // Longitude
-    double longitude_deg = safe_atof(field[5]);
-    if (field[6][0] == 'E') {
-        session->newdata.longitude = longitude_deg;
-    }
-    else if (field[6][0] == 'W') {
-        session->newdata.longitude = -longitude_deg;
-    }
-
-    // If at least one of lat/lon was valid, set the mode and update the mask
-    if ((session->newdata.latitude != 0.0) || (session->newdata.longitude != 0.0)) {
-        session->newdata.mode = MODE_2D;
-        mask |= (LATLON_SET);
+    if (0 == do_lat_lon(&field[3], &session->newdata)) {
+      session->newdata.mode = MODE_2D;
+      mask |= LATLON_SET;
     }
     else {
       GPSD_LOG(LOG_ERROR, &session->context->errout,
